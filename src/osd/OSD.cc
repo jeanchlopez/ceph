@@ -71,6 +71,7 @@
 #include "messages/MOSDPGTemp.h"
 
 #include "messages/MOSDMap.h"
+#include "messages/MMonGetOSDMap.h"
 #include "messages/MOSDPGNotify.h"
 #include "messages/MOSDPGQuery.h"
 #include "messages/MOSDPGLog.h"
@@ -1284,132 +1285,6 @@ void OSDService::queue_for_peering(PG *pg)
 #undef dout_prefix
 #define dout_prefix *_dout
 
-int OSD::convert_collection(ObjectStore *store, coll_t cid)
-{
-  coll_t tmp0("convertfs_temp");
-  coll_t tmp1("convertfs_temp1");
-  vector<ghobject_t> objects;
-
-  map<string, bufferptr> aset;
-  int r = store->collection_getattrs(cid, aset);
-  if (r < 0)
-    return r;
-
-  {
-    ObjectStore::Transaction t;
-    t.create_collection(tmp0);
-    for (map<string, bufferptr>::iterator i = aset.begin();
-	 i != aset.end();
-	 ++i) {
-      bufferlist val;
-      val.push_back(i->second);
-      t.collection_setattr(tmp0, i->first, val);
-    }
-    store->apply_transaction(t);
-  }
-
-  ghobject_t next;
-  while (!next.is_max()) {
-    objects.clear();
-    ghobject_t start = next;
-    r = store->collection_list_partial(cid, start,
-				       200, 300, 0,
-				       &objects, &next);
-    if (r < 0)
-      return r;
-
-    ObjectStore::Transaction t;
-    for (vector<ghobject_t>::iterator i = objects.begin();
-	 i != objects.end();
-	 ++i) {
-      t.collection_add(tmp0, cid, *i);
-    }
-    store->apply_transaction(t);
-  }
-
-  {
-    ObjectStore::Transaction t;
-    t.collection_rename(cid, tmp1);
-    t.collection_rename(tmp0, cid);
-    store->apply_transaction(t);
-  }
-
-  recursive_remove_collection(store, tmp1);
-  store->sync_and_flush();
-  store->sync();
-  return 0;
-}
-
-int OSD::do_convertfs(ObjectStore *store)
-{
-  int r = store->mount();
-  if (r < 0)
-    return r;
-
-  uint32_t version;
-  r = store->version_stamp_is_valid(&version);
-  if (r < 0)
-    return r;
-  if (r == 1)
-    return store->umount();
-
-  derr << "ObjectStore is old at version " << version << ".  Updating..."  << dendl;
-
-  derr << "Removing tmp pgs" << dendl;
-  vector<coll_t> collections;
-  r = store->list_collections(collections);
-  if (r < 0)
-    return r;
-  for (vector<coll_t>::iterator i = collections.begin();
-       i != collections.end();
-       ++i) {
-    spg_t pgid;
-    if (i->is_temp(pgid))
-      recursive_remove_collection(store, *i);
-    else if (i->to_str() == "convertfs_temp" ||
-	     i->to_str() == "convertfs_temp1")
-      recursive_remove_collection(store, *i);
-  }
-  store->flush();
-
-
-  derr << "Getting collections" << dendl;
-
-  derr << collections.size() << " to process." << dendl;
-  collections.clear();
-  r = store->list_collections(collections);
-  if (r < 0)
-    return r;
-  int processed = 0;
-  for (vector<coll_t>::iterator i = collections.begin();
-       i != collections.end();
-       ++i, ++processed) {
-    derr << processed << "/" << collections.size() << " processed" << dendl;
-    uint32_t collection_version;
-    r = store->collection_version_current(*i, &collection_version);
-    if (r < 0) {
-      return r;
-    } else if (r == 1) {
-      derr << "Collection " << *i << " is up to date" << dendl;
-    } else {
-      derr << "Updating collection " << *i << " current version is " 
-	   << collection_version << dendl;
-      r = convert_collection(store, *i);
-      if (r < 0)
-	return r;
-      derr << "collection " << *i << " updated" << dendl;
-    }
-  }
-  derr << "All collections up to date, updating version stamp..." << dendl;
-  r = store->update_version_stamp();
-  if (r < 0)
-    return r;
-  store->sync_and_flush();
-  store->sync();
-  derr << "Version stamp updated, done with upgrade!" << dendl;
-  return store->umount();
-}
-
 int OSD::mkfs(CephContext *cct, ObjectStore *store, const string &dev,
 	      uuid_d fsid, int whoami)
 {
@@ -2570,7 +2445,7 @@ void OSD::recursive_remove_collection(ObjectStore *store, coll_t tmp)
     int r = mapper.remove_oid(p->hobj, &_t);
     if (r != 0 && r != -ENOENT)
       assert(0);
-    t.collection_remove(tmp, *p);
+    t.remove(tmp, *p);
     if (removed > 300) {
       int r = store->apply_transaction(t);
       assert(r == 0);
@@ -2774,7 +2649,8 @@ PG *OSD::get_pg_or_queue_for_pg(const spg_t& pgid, OpRequestRef& op)
 {
   Session *session = static_cast<Session*>(
     op->get_req()->get_connection()->get_priv());
-  assert(session);
+  if (!session)
+    return NULL;
   // get_pg_or_queue_for_pg is only called from the fast_dispatch path where
   // the session_dispatch_lock must already be held.
   assert(session->session_dispatch_lock.is_locked());
@@ -2859,9 +2735,11 @@ void OSD::load_pgs()
     spg_t pgid;
     snapid_t snap;
     uint64_t seq;
+    char val;
 
     if (it->is_temp(pgid) ||
-	it->is_removal(&seq, &pgid)) {
+	it->is_removal(&seq, &pgid) ||
+	store->collection_getattr(*it, "remove", &val, 1) > 0) {
       dout(10) << "load_pgs " << *it << " clearing temp" << dendl;
       recursive_remove_collection(store, *it);
       continue;
@@ -5531,14 +5409,15 @@ void OSD::ms_fast_dispatch(Message *m)
   }
   OSDMapRef nextmap = service.get_nextmap_reserved();
   Session *session = static_cast<Session*>(m->get_connection()->get_priv());
-  assert(session);
-  {
-    Mutex::Locker l(session->session_dispatch_lock);
-    update_waiting_for_pg(session, nextmap);
-    session->waiting_on_map.push_back(op);
-    dispatch_session_waiting(session, nextmap);
+  if (session) {
+    {
+      Mutex::Locker l(session->session_dispatch_lock);
+      update_waiting_for_pg(session, nextmap);
+      session->waiting_on_map.push_back(op);
+      dispatch_session_waiting(session, nextmap);
+    }
+    session->put();
   }
-  session->put();
   service.release_map(nextmap);
 }
 
@@ -5548,10 +5427,12 @@ void OSD::ms_fast_preprocess(Message *m)
     if (m->get_type() == CEPH_MSG_OSD_MAP) {
       MOSDMap *mm = static_cast<MOSDMap*>(m);
       Session *s = static_cast<Session*>(m->get_connection()->get_priv());
-      s->received_map_lock.Lock();
-      s->received_map_epoch = mm->get_last();
-      s->received_map_lock.Unlock();
-      s->put();
+      if (s) {
+	s->received_map_lock.Lock();
+	s->received_map_epoch = mm->get_last();
+	s->received_map_lock.Unlock();
+	s->put();
+      }
     }
   }
 }
@@ -5756,13 +5637,15 @@ bool OSD::dispatch_op_fast(OpRequestRef& op, OSDMapRef& osdmap)
   if (msg_epoch > osdmap->get_epoch()) {
     Session *s = static_cast<Session*>(op->get_req()->
 				       get_connection()->get_priv());
-    s->received_map_lock.Lock();
-    epoch_t received_epoch = s->received_map_epoch;
-    s->received_map_lock.Unlock();
-    if (received_epoch < msg_epoch) {
-      osdmap_subscribe(msg_epoch, false);
+    if (s) {
+      s->received_map_lock.Lock();
+      epoch_t received_epoch = s->received_map_epoch;
+      s->received_map_lock.Unlock();
+      if (received_epoch < msg_epoch) {
+	osdmap_subscribe(msg_epoch, false);
+      }
+      s->put();
     }
-    s->put();
     return false;
   }
 
@@ -6141,9 +6024,6 @@ void OSD::handle_osd_map(MOSDMap *m)
     return;
   }
 
-  // even if this map isn't from a mon, we may have satisfied our subscription
-  monc->sub_got("osdmap", last);
-
   // missing some?
   bool skip_maps = false;
   if (first > osdmap->get_epoch() + 1) {
@@ -6202,8 +6082,7 @@ void OSD::handle_osd_map(MOSDMap *m)
       OSDMap *o = new OSDMap;
       if (e > 1) {
 	bufferlist obl;
-	OSDMapRef prev = get_map(e - 1);
-	prev->encode(obl);
+	get_map_bl(e - 1, obl);
 	o->decode(obl);
       }
 
@@ -6219,7 +6098,27 @@ void OSD::handle_osd_map(MOSDMap *m)
 	last_marked_full = e;
 
       bufferlist fbl;
-      o->encode(fbl);
+      o->encode(fbl, inc.encode_features | CEPH_FEATURE_RESERVED);
+
+      bool injected_failure = false;
+      if (g_conf->osd_inject_bad_map_crc_probability > 0 &&
+	  (rand() % 10000) < g_conf->osd_inject_bad_map_crc_probability*10000.0) {
+	derr << __func__ << " injecting map crc failure" << dendl;
+	injected_failure = true;
+      }
+
+      if (o->get_crc() != inc.full_crc || injected_failure) {
+	dout(2) << "got incremental " << e
+		<< " but failed to encode full with correct crc; requesting"
+		<< dendl;
+	clog->warn() << "failed to encode map e" << e << " with expected crc\n";
+	MMonGetOSDMap *req = new MMonGetOSDMap;
+	req->request_full(e, last);
+	monc->send_mon_message(req);
+	last = e - 1;
+	break;
+      }
+
 
       hobject_t fulloid = get_osdmap_pobject_name(e);
       t.write(META_COLL, fulloid, 0, fbl.length(), fbl);
@@ -6229,6 +6128,16 @@ void OSD::handle_osd_map(MOSDMap *m)
     }
 
     assert(0 == "MOSDMap lied about what maps it had?");
+  }
+
+  // even if this map isn't from a mon, we may have satisfied our subscription
+  monc->sub_got("osdmap", last);
+
+  if (last <= osdmap->get_epoch()) {
+    dout(10) << " no new maps here, dropping" << dendl;
+    delete _t;
+    m->put();
+    return;
   }
 
   if (superblock.oldest_map) {
@@ -8222,7 +8131,7 @@ void OSD::handle_replica_op(OpRequestRef& op, OSDMapRef& osdmap)
     op->send_map_update = should_share_map;
     op->sent_epoch = m->map_epoch;
     enqueue_op(pg, op);
-  } else if (should_share_map) {
+  } else if (should_share_map && m->get_connection()->is_connected()) {
     C_SendMap *send_map = new C_SendMap(this, m->get_source(),
 					m->get_connection(),
                                         osdmap, m->map_epoch);
