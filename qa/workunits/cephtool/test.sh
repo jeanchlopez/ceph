@@ -1334,9 +1334,9 @@ MDS_TESTS=(
 )
 
 TESTS=(
-  $MON_TESTS
-  $OSD_TESTS
-  $MDS_TESTS
+  ${MON_TESTS[@]}
+  ${OSD_TESTS[@]}
+  ${MDS_TESTS[@]}
 )
 
 #
@@ -1374,13 +1374,13 @@ while [[ $# -gt 0 ]]; do
       sanity_check=false
       ;;
     "--test-mon" )
-      tests_to_run=("${tests_to_run[@]}" $MON_TESTS)
+      tests_to_run=("${tests_to_run[@]}" "${MON_TESTS[@]}")
       ;;
     "--test-osd" )
-      tests_to_run=("${tests_to_run[@]}" $OSD_TESTS)
+      tests_to_run=("${tests_to_run[@]}" "${OSD_TESTS[@]}")
       ;;
     "--test-mds" )
-      tests_to_run=("${tests_to_run[@]}" $MDS_TESTS)
+      tests_to_run=("${tests_to_run[@]}" "${MDS_TESTS[@]}")
       ;;
     "-t" )
       shift
